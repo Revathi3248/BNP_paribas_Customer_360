@@ -1,0 +1,362 @@
+ingest_and_clean.py - Stage 1: Ingestion & Cleansing
+
+Reads the three raw source CSVs (Core Banking, Credit Card, Loan System),
+validates their structure, tags every row with its source system, cleans
+text fields (trim, proper case), fills missing columns explicitly, and
+standardizes addresses using reference_data.csv.
+
+Output: one cleaned, source-tagged CSV per source, written to --out-dir,
+plus a rejected_rows.csv log of anything that failed row-level validation.
+
+Usage:
+    python ingest_and_clean.py --data-dir ./data --out-dir ./staging
+
+Files expected in --data-dir:
+    core_banking.csv, credit_card.csv, loan_system.csv   (required)
+    reference_data.csv                                    (optional -- address
+                                                             standardization is
+                                                             skipped if absent)
+    trust_hierarchy.json                                  (not used at this
+                                                             stage -- only
+                                                             loaded here to
+                                                             confirm the source
+                                                             mapping ahead of
+                                                             the Survivorship
+                                                             stage)
+
+Assumed schemas (edit SOURCES below if your real files differ):
+    core_banking.csv : Customer_ID, Name, Email, Phone, DOB, Address
+    credit_card.csv  : Cust_Ref, Name, Email, Phone, Credit_Limit, Address
+    loan_system.csv  : Loan_Cust_ID, Name, Phone, Loan_Amt, Address
+    reference_data.csv : Short_Form, Long_Form
+"""
+
+from _future_ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+
+# --------------------------------------------------------------------------
+# Source mapping: aligns internal source names with trust_hierarchy.json's
+# SourceA/B/C convention, so the Survivorship stage can look priorities up
+# without re-deriving this mapping.
+# --------------------------------------------------------------------------
+SOURCE_MAPPING = {
+    "CoreBanking": "SourceA",
+    "CreditCard": "SourceB",
+    "LoanSystem": "SourceC",
+}
+
+# --------------------------------------------------------------------------
+# Configuration: one entry per source file. Edit this if your real CSVs
+# use different filenames or column names -- nothing else in the script
+# needs to change.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SourceConfig:
+    source_name: str          # tag written into every row, e.g. "CoreBanking"
+    filename: str              # expected filename under --data-dir
+    id_column: str             # this source's unique ID column
+    required_columns: list     # columns that MUST be present or the file is rejected
+    optional_columns: list     # columns that may be missing (e.g. Loan has no Email)
+
+
+SOURCES = [
+    SourceConfig(
+        source_name="CoreBanking",
+        filename="core_banking.csv",
+        id_column="Customer_ID",
+        required_columns=["Customer_ID", "Name", "Phone", "Address"],
+        optional_columns=["Email", "DOB"],
+    ),
+    SourceConfig(
+        source_name="CreditCard",
+        filename="credit_card.csv",
+        id_column="Cust_Ref",
+        required_columns=["Cust_Ref", "Name", "Phone", "Address"],
+        optional_columns=["Email", "Credit_Limit"],
+    ),
+    SourceConfig(
+        source_name="LoanSystem",
+        filename="loan_system.csv",
+        id_column="Loan_Cust_ID",
+        required_columns=["Loan_Cust_ID", "Name", "Phone", "Address"],
+         optional_columns=["Email", "Loan_Amt"],  # Loan has no Email -- created as null
+    ),
+]
+
+# Common schema every cleaned output will conform to, regardless of source.
+COMMON_COLUMNS = [
+    "source_system", "source_record_id", "name", "email",
+    "phone", "dob", "address",
+]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("ingest_and_clean")
+
+
+# --------------------------------------------------------------------------
+# Pre-run validation
+# --------------------------------------------------------------------------
+
+def validate_setup(data_dir: Path) -> bool:
+    """Check that all required source CSVs exist before doing any work,
+    so a missing file fails fast with one clear message instead of being
+    discovered mid-run."""
+    missing = [cfg.filename for cfg in SOURCES if not (data_dir / cfg.filename).exists()]
+    if missing:
+        logger.error("Missing required CSV files in %s: %s", data_dir, ", ".join(missing))
+        return False
+
+    logger.info(
+        "Found all %d source CSVs. Reference data: %s",
+        len(SOURCES),
+        "found" if (data_dir / "reference_data.csv").exists() else "not found (address standardization will be skipped)",
+    )
+    return True
+
+
+def load_trust_hierarchy(trust_path: Path) -> dict | None:
+    """Load trust_hierarchy.json if present. Not used for any cleaning logic
+    at this stage -- it's read here only to confirm the source mapping ahead
+    of the Survivorship stage, which is where it actually gets applied."""
+    if not trust_path.exists():
+        logger.warning("trust_hierarchy.json not found at %s (only needed for the Survivorship stage).", trust_path)
+        return None
+    try:
+        with open(trust_path) as f:
+            hierarchy = json.load(f)
+        logger.info("Loaded trust_hierarchy.json.")
+        return hierarchy
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not parse trust_hierarchy.json: %s", exc)
+        return None
+
+
+# --------------------------------------------------------------------------
+# Loading & validation
+# --------------------------------------------------------------------------
+
+def load_source(path: Path, cfg: SourceConfig, rejected_rows: list) -> pd.DataFrame | None:
+    """Load one source CSV. Returns None (and logs) if the file is unusable."""
+    if not path.exists():
+        logger.error("Missing file: %s (expected for source %s)", path, cfg.source_name)
+        return None
+
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=True)
+    except (pd.errors.ParserError, UnicodeDecodeError, OSError) as exc:
+        logger.error("Failed to parse %s: %s", path, exc)
+        return None
+
+    if df.empty:
+        logger.warning("%s is empty -- skipping.", path)
+        return None
+
+    missing_required = [c for c in cfg.required_columns if c not in df.columns]
+    if missing_required:
+        logger.error(
+            "%s is missing required columns %s -- skipping file.",
+            path, missing_required,
+        )
+         return None
+
+    # Ensure optional columns exist even if absent in the raw file (e.g. Loan has no Email)
+    for col in cfg.optional_columns:
+        if col not in df.columns:
+            logger.info(
+                "%s has no '%s' column -- creating it as null.", cfg.source_name, col
+            )
+            df[col] = pd.NA
+
+    # Flag rows missing their own ID -- can't ingest a record with no identifier
+    id_missing_mask = df[cfg.id_column].isna() | (df[cfg.id_column].astype(str).str.strip() == "")
+    if id_missing_mask.any():
+        bad_rows = df[id_missing_mask].copy()
+        bad_rows["reject_reason"] = f"Missing {cfg.id_column}"
+        bad_rows["source_system"] = cfg.source_name
+        rejected_rows.append(bad_rows)
+        df = df[~id_missing_mask]
+        logger.warning(
+            "%s: rejected %d row(s) with missing %s.",
+            cfg.source_name, id_missing_mask.sum(), cfg.id_column,
+        )
+
+    return df
+
+
+# --------------------------------------------------------------------------
+# Cleaning
+# --------------------------------------------------------------------------
+
+def _blank_to_na(series: pd.Series) -> pd.Series:
+    """Treat whitespace-only strings as true nulls, not as populated values."""
+    return series.apply(
+        lambda v: pd.NA if (pd.isna(v) or str(v).strip() == "") else str(v).strip()
+    )
+
+
+def to_proper_case(series: pd.Series) -> pd.Series:
+    """Trim and title-case names. Does not attempt to reorder or split names --
+    genuine name-order inconsistencies (e.g. two names swapped) are left for
+    the fuzzy matching stage, not silently 'corrected' here."""
+    return series.apply(
+        lambda v: v if pd.isna(v) else " ".join(w.capitalize() for w in str(v).split())
+    )
+
+
+def load_reference_data(path: Path) -> dict:
+    """Load Short_Form -> Long_Form address token mapping."""
+    if not path.exists():
+        logger.warning("reference_data.csv not found at %s -- address standardization skipped.", path)
+        return {}
+
+    try:
+        ref = pd.read_csv(path, dtype=str)
+        ref.columns = [c.strip() for c in ref.columns]
+        if "Short_Form" not in ref.columns or "Long_Form" not in ref.columns:
+            logger.error("reference_data.csv must have Short_Form and Long_Form columns.")
+            return {}
+        mapping = dict(zip(ref["Short_Form"].str.strip(), ref["Long_Form"].str.strip()))
+        logger.info("Loaded reference_data.csv with %d mapping(s).", len(mapping))
+        return mapping
+    except (pd.errors.ParserError, OSError) as exc:
+        logger.error("Failed to load reference_data.csv: %s", exc)
+        return {}
+
+
+def standardize_address(address: str, ref_map: dict) -> str:
+    """Replace short-form address tokens with their long form, using word
+    boundaries so we don't rewrite part of an unrelated word."""
+    if pd.isna(address) or not ref_map:
+        return address
+    text = str(address)
+    for short, long in ref_map.items():
+        # Word-boundary match, case-INSENSITIVE: real address data mixes ALL
+         # CAPS ("973 MICHAEL PL.") with mixed case ("948 Rivera St."), while
+        # reference_data.csv only defines one casing per abbreviation. The
+        # replacement always uses the reference file's casing (Long_Form),
+        # which is what "standardization" means here.
+        # Trailing '.' in the short form (e.g. "St.") is consumed via lookahead
+        # rather than \b, since a '.' followed by punctuation (e.g. ", ") is not
+        # a word boundary and would otherwise be left behind (e.g. "Street.,").
+        pattern = re.escape(short.rstrip("."))
+        if short.endswith("."):
+            text = re.sub(rf"\b{pattern}\.?(?!\w)", long, text, flags=re.IGNORECASE)
+        else:
+            text = re.sub(rf"\b{pattern}\b", long, text, flags=re.IGNORECASE)
+    return text
+
+
+def clean_source(df: pd.DataFrame, cfg: SourceConfig, ref_map: dict) -> pd.DataFrame:
+    """Apply trimming, proper-casing, null handling, and address standardization,
+    then reshape to the common schema with source tagging."""
+    out = pd.DataFrame()
+    out["source_system"] = cfg.source_name
+    out["source_record_id"] = df[cfg.id_column].astype(str).str.strip()
+    out["name"] = to_proper_case(_blank_to_na(df["Name"]))
+    out["email"] = _blank_to_na(df["Email"]).apply(
+        lambda v: v if pd.isna(v) else v.lower()
+    )
+    out["phone"] = _blank_to_na(df["Phone"]).apply(
+        lambda v: v if pd.isna(v) else re.sub(r"\D", "", v)  # digits only
+    )
+    out["dob"] = _blank_to_na(df["DOB"]) if "DOB" in df.columns else pd.NA
+    out["address"] = _blank_to_na(df["Address"]).apply(
+        lambda v: v if pd.isna(v) else standardize_address(v, ref_map)
+    )
+    out["source_system"] = cfg.source_name  # re-assert after column ops
+    return out[COMMON_COLUMNS]
+
+
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+
+def run(data_dir: Path, out_dir: Path) -> None:
+    logger.info("=" * 70)
+    logger.info("MDM INGESTION & CLEANING -- STAGE 1")
+    logger.info("=" * 70)
+
+    if not validate_setup(data_dir):
+        sys.exit(1)
+
+    hierarchy = load_trust_hierarchy(data_dir / "trust_hierarchy.json")
+    if hierarchy:
+        logger.info("Source mapping (for the upcoming Survivorship stage):")
+        for internal, external in SOURCE_MAPPING.items():
+            logger.info("  %s -> %s", external, internal)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rejected_rows: list = []
+    ref_map = load_reference_data(data_dir / "reference_data.csv")
+
+    any_success = False
+    stats: dict[str, int] = {}
+
+    for cfg in SOURCES:
+        logger.info("-" * 70)
+        logger.info("Processing: %s", cfg.source_name)
+        raw = load_source(data_dir / cfg.filename, cfg, rejected_rows)
+        if raw is None:
+            continue
+
+        cleaned = clean_source(raw, cfg, ref_map)
+        out_path = out_dir / f"clean_{cfg.filename}"
+        cleaned.to_csv(out_path, index=False)
+        stats[cfg.source_name] = len(cleaned)
+        logger.info("Wrote %d cleaned row(s) to %s", len(cleaned), out_path.name)
+        any_success = True
+
+    if rejected_rows:
+        rejected_df = pd.concat(rejected_rows, ignore_index=True)
+        rejected_path = out_dir / "rejected_rows.csv"
+        rejected_df.to_csv(rejected_path, index=False)
+        logger.warning("Wrote %d rejected row(s) to rejected_rows.csv", len(rejected_df))
+
+    if not any_success:
+        logger.error("No sources were successfully processed. Check the errors above.")
+        sys.exit(1)
+
+    logger.info("-" * 70)
+    logger.info("INGESTION & CLEANING COMPLETE")
+    logger.info("Summary:")
+    for source, count in stats.items():
+        logger.info("  %s: %d rows", source, count)
+    logger.info("Total: %d rows", sum(stats.values()))
+    logger.info("=" * 70)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=_doc_)
+    parser.add_argument(
+        "--data-dir", type=Path, default=Path("./data"),
+        help="Folder containing the raw source CSVs and reference_data.csv",
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("./staging"),
+        help="Folder to write cleaned staging CSVs and the rejected-rows log",
+    )
+    # parse_known_args (not parse_args) so this doesn't crash when launched
+    # inside Jupyter/IPython, which injects its own extra arguments like
+    # "-f kernel.json" that this script doesn't care about.
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        logger.debug("Ignoring unrecognized arguments (likely from the notebook launcher): %s", unknown)
+    return args
+
+
+if _name_ == "_main_":
+    args = parse_args()
+    run(args.data_dir, args.out_dir)
